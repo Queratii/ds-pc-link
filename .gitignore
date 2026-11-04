@@ -1,0 +1,27 @@
+# ESP-IDF (esp32-bridge)
+esp32-bridge/build/
+esp32-bridge/sdkconfig
+esp32-bridge/sdkconfig.old
+esp32-bridge/managed_components/
+esp32-bridge/dependencies.lock
+
+# BlocksDS (ds-homebrew) : on ignore la démo compilée, pas homebrews/
+ds-homebrew/build/
+ds-homebrew/*.nds
+ds-homebrew/*.elf
+ds-homebrew/*.map
+
+# Arduino (esp-pont)
+esp-pont/build/
+
+# Python / tests
+__pycache__/
+*.pyc
+tests/*.exe
+tests/*.o
+
+# Captures
+*.pcap
+
+# Réglages locaux de Claude Code
+**/.claude/settings.local.json
