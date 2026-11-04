@@ -6,6 +6,10 @@
   cartouche)                                                                       votre port PC)
 ```
 
+**Pour installer le projet pas à pas, voir le [tutoriel d'installation](INSTALL.md).**
+**Pour tout piloter sans ligne de commande : `python pc-host/dslink_gui.py`** (interface graphique,
+avec le mode d'emploi de chaque fonction).
+
 Le kit couvre deux situations très différentes :
 
 | | **Homebrews** (vous contrôlez le code DS) | **Cartouches d'origine** |
@@ -26,6 +30,7 @@ common/cobs.h             encodage COBS
 esp32-bridge/             firmware ESP-IDF 5.x (pont + capture)
 ds-homebrew/              bibliothèque dslink.c/.h + démo (BlocksDS)
 pc-host/dslink.py         client PC : démo, capture pcap, analyse, rejeu de beacon
+pc-host/dslink_gui.py     interface graphique (Tkinter) de toutes ces fonctions + ESP-Pont
 tests/                    tests hors matériel (C <-> Python, pcap, analyseur)
 esp-pont/                 ESP-Pont : point d'accès ouvert 802.11b routé + relais dslink (Arduino)
 homebrews/VoidCrew.nds    jeu homebrew Wi-Fi (BlocksDS), prêt à lancer sur la DS
