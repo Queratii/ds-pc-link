@@ -97,7 +97,13 @@ Ce logiciel relie une Nintendo DS, vraie ou émulée, à ce PC. Chaque onglet ac
 - melonDS : aucun matériel. Onglet Liaison DS, mode « melonDS ». Sur la DS : touche B.
 - Vraie DS + ESP-Pont (recommandé) : onglet ESP-Pont pour vérifier le boîtier, puis Liaison DS, mode « ESP-Pont ». Sur la DS : touche B.
 - Vraie DS + pont radio ESP32 : onglet Liaison DS, mode « Pont radio ESP32 ». Sur la DS : touche A.
+- Vraies DS et melonDS qui jouent ensemble : onglet Liaison DS, les deux transports cochés (hub). Chaque console a son propre `NODE`.
 Les boutons en bas de cette page ouvrent directement le bon réglage.
+
+## Ce qui est possible, et ce qui ne l'est pas
+- Possible : faire jouer ensemble vraies DS (via un ESP32 : pont radio ou ESP-Pont) et DS émulées dans melonDS, avec un jeu qui utilise `dslink`.
+- Expérimental, hors de ce logiciel : le multijoueur natif (cartouches, « salon Wi-Fi local » de Void Crew), avec melonDS hôte et de vraies DS clientes. Il passe par une version de melonDS modifiée qui parle directement à l'ESP32 : voir `melonds-esp32/README.md`.
+- Pas réalisé : une vraie DS hôte et melonDS client en multijoueur natif. L'ESP32 devrait répondre seul aux CMD en quelques centaines de µs.
 
 ## Les onglets
 - Liaison DS : démarre la démo. Les DS connectées s'affichent avec leurs touches, et vous pouvez leur envoyer du texte.
@@ -236,7 +242,35 @@ Phase 2 du travail sur les cartouches d'origine : l'ESP32 réémet l'annonce de 
 - Intervalle : période d'émission en millisecondes (100 ms, comme une vraie DS).
 """
 
-MODE_GUIDES = {"serial": GUIDE_SERIAL, "udp": GUIDE_UDP, "relay": GUIDE_RELAY}
+GUIDE_HUB = """
+# Hub : vraies DS et melonDS ensemble
+Avec les deux transports cochés, le PC fait suivre les messages de chaque DS à toutes les autres. Des vraies DS (via l'ESP32) et des DS émulées dans melonDS jouent alors ensemble, comme si elles étaient côte à côte.
+
+## Montages possibles
+- Vraies DS par le pont radio ESP32 : touche A dans la démo.
+- Vraies DS par ESP-Pont : touche B, et l'adresse d'ESP-Pont dans « Relais ».
+- DS émulées dans melonDS, sur ce PC : touche B.
+On peut combiner les trois.
+
+## Étapes
+1. Donnez à chaque console un numéro différent : une démo compilée par console, avec son `NODE` (1 à 15) dans `ds-homebrew/source/main.c`.
+2. Cochez les transports utilisés et réglez-les.
+3. Cliquez « Démarrer », puis lancez la démo sur chaque console.
+4. Sur chaque DS, la section « autres DS » affiche les touches tenues par les autres consoles : appuyez sur une touche d'une DS, elle apparaît sur les autres.
+
+## Limites
+- Seuls les jeux qui utilisent dslink en profitent. Les cartouches d'origine et le multijoueur local de DSWiFi (le « salon Wi-Fi local » de Void Crew, par exemple) emploient le protocole de Nintendo, que ce hub ne traduit pas.
+- Les DS du pont radio s'entendent déjà entre elles : le hub ne leur renvoie que les messages des autres transports.
+- La latence s'additionne : quelques millisecondes par l'ESP32, un peu plus par ESP-Pont et melonDS. Un jeu dslink doit tolérer des pertes et des retards (envoyer l'état complet régulièrement).
+"""
+
+GUIDE_NONE = """
+# Liaison DS
+Cochez au moins un transport :
+- Pont radio ESP32 : vraies DS, touche A dans la démo.
+- Réseau UDP : DS dans melonDS, et vraies DS derrière ESP-Pont (renseignez alors « Relais »). Touche B dans la démo.
+Les deux à la fois activent le hub : toutes les DS jouent ensemble.
+"""
 
 
 # ==========================================================================
@@ -398,53 +432,72 @@ def open_bridge(port: str, channel: int, mode: int, post, stop_evt) -> dl.DsLink
 
 
 class LinkWorker(Worker):
-    def __init__(self, post, mode, port="", channel=7, udp_port=dl.LINK_UDP_PORT, relay=None):
+    """Liaison DS sur un ou plusieurs transports, reliés par le hub : avec
+    plusieurs transports, les DS de chacun reçoivent les messages des autres."""
+
+    def __init__(self, post, use_radio, use_udp, port="", channel=7,
+                 udp_port=dl.LINK_UDP_PORT, relay=None):
         super().__init__(post)
-        self.mode, self.port, self.channel = mode, port, channel
+        self.use_radio, self.use_udp = use_radio, use_udp
+        self.port, self.channel = port, channel
         self.udp_port, self.relay = udp_port, relay
-        self.br = None
+        self.hub: dl.DsLinkHub | None = None
 
     def run(self):
-        if self.mode == "serial":
-            br = open_bridge(self.port, self.channel, dl.MODE_LINK, self.post, self.stop_evt)
-        else:
-            br = dl.DsLinkUdp(self.udp_port, relay=self.relay if self.mode == "relay" else None)
-            self.post("log", f"Écoute UDP sur le port {br.port}.")
-            if br.relay:
-                self.post("log", f"Inscription auprès d'ESP-Pont {br.relay[0]}:{br.relay[1]}.")
-        self.br = br
+        bridges = []
+        try:
+            if self.use_radio:
+                bridges.append(open_bridge(self.port, self.channel, dl.MODE_LINK,
+                                           self.post, self.stop_evt))
+                self.post("log", f"Pont radio : canal {self.channel} (touche A sur les DS).")
+            if self.use_udp:
+                br = dl.DsLinkUdp(self.udp_port, relay=self.relay)
+                bridges.append(br)
+                self.post("log", f"Réseau : écoute UDP sur le port {br.port} (touche B sur les DS).")
+                if br.relay:
+                    self.post("log", f"Inscription auprès d'ESP-Pont {br.relay[0]}:{br.relay[1]}.")
+        except BaseException:
+            for b in bridges:
+                b.close()
+            raise
+        hub = dl.DsLinkHub(bridges)
+        self.hub = hub
+        if len(bridges) > 1:
+            self.post("log", "Hub actif : les DS des différents transports jouent ensemble.")
         self.post("started")
         try:
-            for ev in self.events(br):
+            for ev in self.events(hub):
                 t = ev["type"]
                 if t == dl.SER_EVT_RX_LINK:
                     d = ev["data"]
-                    if d[:1] == b"P":                    # ping -> pong immédiat
-                        br.send_link(b"p" + d[1:5])
+                    pong = dl.demo_pong(ev)
+                    if pong:
+                        hub.reply(ev, pong)
                         self.post("ping", ev["node"])
                     elif d[:1] == b"S" and len(d) >= 9:
                         keys, frame = struct.unpack_from("<II", d, 1)
-                        addr = ev.get("addr")
-                        if addr is None:
-                            where = f"{ev['rssi']} dBm"
-                        elif getattr(br, "relay", None) == addr:
+                        br = ev["bridge"]
+                        if br.kind == "radio":
+                            where = f"radio, {ev['rssi']} dBm"
+                        elif br.relay == ev.get("addr"):
                             where = "via relais ESP-Pont"
                         else:
-                            where = f"{addr[0]}:{addr[1]}"
+                            a = ev.get("addr") or ("?", 0)
+                            where = f"UDP {a[0]}:{a[1]}"
                         self.post("ds", (ev["node"], keys, frame, where))
                 elif t == dl.SER_EVT_LOG:
                     self.post("log", ev["text"])
                 elif t == dl.SER_EVT_STATS:
                     self.post("stats", ev)
         finally:
-            self.br = None
-            br.close()
+            self.hub = None
+            hub.close()
 
     def send_text(self, text: str) -> bool:
-        br = self.br
-        if br is None:
+        hub = self.hub
+        if hub is None:
             return False
-        br.send_link(b"T" + text.encode("utf-8", "replace")[:63])
+        hub.send_link(b"T" + text.encode("utf-8", "replace")[:63])
         return True
 
 
@@ -598,6 +651,8 @@ class HomeTab(ttk.Frame):
                    command=lambda: app.goto_link("relay")).pack(side="left", padx=6)
         ttk.Button(bar, text="Vraie DS + pont radio ESP32",
                    command=lambda: app.goto_link("serial")).pack(side="left")
+        ttk.Button(bar, text="Vraies DS + melonDS ensemble",
+                   command=lambda: app.goto_link("hub")).pack(side="left", padx=6)
 
 
 # --------------------------------------------------------------------------
@@ -608,37 +663,41 @@ class LinkTab(Tab):
         b.columnconfigure(0, weight=1)
         b.rowconfigure(3, weight=1)
 
-        # 1. Mode
-        fm = ttk.LabelFrame(b, text="1. Mode de liaison", padding=8)
+        # 1. Transports (cumulables : à plusieurs, le hub les relie)
+        fm = ttk.LabelFrame(b, text="1. Transports (cochez-en plusieurs pour faire jouer "
+                                    "ensemble vraies DS et melonDS)", padding=8)
         fm.grid(row=0, column=0, sticky="ew")
-        self.mode = tk.StringVar(value="serial")
-        self.radios = []
-        for val, label in (("serial", "Pont radio ESP32 (USB) — vraie DS, touche A sur la DS"),
-                           ("udp", "melonDS (UDP) — émulateur, touche B sur la DS"),
-                           ("relay", "ESP-Pont (relais) — vraie DS sans câble, touche B")):
-            r = ttk.Radiobutton(fm, text=label, value=val, variable=self.mode,
-                                command=self._mode_changed)
-            r.pack(anchor="w")
-            self.radios.append(r)
+        self.use_radio = tk.BooleanVar(value=True)
+        self.use_udp = tk.BooleanVar(value=False)
+        self.checks = [
+            ttk.Checkbutton(fm, text="Pont radio ESP32 (USB) — vraies DS, touche A dans la démo",
+                            variable=self.use_radio, command=self._mode_changed),
+            ttk.Checkbutton(fm, text="Réseau UDP — melonDS, et vraies DS via ESP-Pont, touche B",
+                            variable=self.use_udp, command=self._mode_changed),
+        ]
+        for c in self.checks:
+            c.pack(anchor="w")
 
-        # 2. Réglages (un cadre par mode)
+        # 2. Réglages (un cadre par transport coché)
         self.fs = ttk.LabelFrame(b, text="2. Réglages", padding=8)
         self.fs.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        self.f_serial = ttk.Frame(self.fs)
+        self.f_serial = ttk.LabelFrame(self.fs, text="Pont radio ESP32", padding=6)
         self.port = labeled(self.f_serial, 0, "Port série", PortPicker(self.f_serial))
         self.channel = tk.IntVar(value=7)       # = LINK_DEFAULT_CHANNEL de linkproto.h
         labeled(self.f_serial, 1, "Canal Wi-Fi",
                 ttk.Spinbox(self.f_serial, from_=1, to=13, width=5, textvariable=self.channel))
-        self.f_udp = ttk.Frame(self.fs)
+        self.f_udp = ttk.LabelFrame(self.fs, text="Réseau UDP", padding=6)
         self.udp_port = tk.IntVar(value=dl.LINK_UDP_PORT)
         labeled(self.f_udp, 0, "Port UDP",
                 ttk.Entry(self.f_udp, width=8, textvariable=self.udp_port))
-        self.f_relay = ttk.Frame(self.fs)
+        self.use_relay = tk.BooleanVar(value=False)
         self.relay = tk.StringVar(value="esp-pont.local")
-        labeled(self.f_relay, 0, "Adresse d'ESP-Pont",
-                ttk.Entry(self.f_relay, width=24, textvariable=self.relay))
-        labeled(self.f_relay, 1, "Port UDP",
-                ttk.Entry(self.f_relay, width=8, textvariable=self.udp_port))
+        fr_ = ttk.Frame(self.f_udp)
+        ttk.Checkbutton(fr_, text="via ESP-Pont :", variable=self.use_relay,
+                        command=self._mode_changed).pack(side="left")
+        ttk.Entry(fr_, width=24, textvariable=self.relay).pack(side="left", padx=(6, 0))
+        labeled(self.f_udp, 1, "Relais", fr_)
+        self.f_none = ttk.Label(self.fs, text="Cochez au moins un transport.")
 
         # 3. Démarrage + liste des DS
         fr = ttk.LabelFrame(b, text="3. Liaison", padding=8)
@@ -673,30 +732,49 @@ class LinkTab(Tab):
         self.after(500, self._tick)
 
     def _mode_changed(self):
-        m = self.mode.get()
-        for f in (self.f_serial, self.f_udp, self.f_relay):
+        radio, udp, relay = self.use_radio.get(), self.use_udp.get(), self.use_relay.get()
+        for f in (self.f_serial, self.f_udp, self.f_none):
             f.pack_forget()
-        {"serial": self.f_serial, "udp": self.f_udp, "relay": self.f_relay}[m].pack(anchor="w")
-        set_rich_text(self.guide, MODE_GUIDES[m])
+        if radio:
+            self.f_serial.pack(fill="x", anchor="w")
+        if udp:
+            self.f_udp.pack(fill="x", anchor="w", pady=(6 if radio else 0, 0))
+        if not (radio or udp):
+            self.f_none.pack(anchor="w")
+        if radio and udp:
+            guide = GUIDE_HUB
+        elif radio:
+            guide = GUIDE_SERIAL
+        elif udp:
+            guide = GUIDE_RELAY if relay else GUIDE_UDP
+        else:
+            guide = GUIDE_NONE
+        set_rich_text(self.guide, guide)
 
     def set_mode(self, mode: str, relay: str | None = None):
+        """Préréglage depuis l'accueil : serial, udp, relay ou hub."""
         if self.worker:
             return
-        self.mode.set(mode)
+        self.use_radio.set(mode in ("serial", "hub"))
+        self.use_udp.set(mode in ("udp", "relay", "hub"))
+        self.use_relay.set(mode == "relay")
         if relay:
             self.relay.set(relay)
         self._mode_changed()
 
     def start(self):
-        m = self.mode.get()
+        if not (self.use_radio.get() or self.use_udp.get()):
+            self.log.add("Cochez au moins un transport.")
+            return
         self.tree.delete(*self.tree.get_children())
         self.seen.clear()
-        self.worker = LinkWorker(self.post, m, port=self.port.get(),
-                                 channel=int_of(self.channel, 7),
+        relay = self.relay.get().strip() if self.use_relay.get() else ""
+        self.worker = LinkWorker(self.post, self.use_radio.get(), self.use_udp.get(),
+                                 port=self.port.get(), channel=int_of(self.channel, 7),
                                  udp_port=int_of(self.udp_port, dl.LINK_UDP_PORT),
-                                 relay=self.relay.get().strip() or None)
-        for r in self.radios:
-            r.configure(state="disabled")
+                                 relay=relay or None)
+        for c in self.checks:
+            c.configure(state="disabled")
         self.ss.running(True, "démarrage…")
         self.worker.start()
 
@@ -721,8 +799,8 @@ class LinkTab(Tab):
             self.ss.running(True, "en marche — en attente des DS")
         elif kind == "ended":
             self.worker = None
-            for r in self.radios:
-                r.configure(state="normal")
+            for c in self.checks:
+                c.configure(state="normal")
             self.ss.running(False, "arrêté")
         elif kind == "ds":
             node, keys, frame, where = p

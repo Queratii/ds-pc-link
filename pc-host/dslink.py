@@ -7,6 +7,7 @@ Commandes :
   python dslink.py demo    --port COM5           homebrew : dialogue avec la démo DS
   python dslink.py demo    --udp                 idem sans ESP32 (melonDS)
   python dslink.py demo    --relay esp-pont.local  idem, vraie DS derrière ESP-Pont
+  python dslink.py demo    --port COM5 --udp     hub : vraies DS + melonDS ensemble
   python dslink.py sniff   --port COM5 -o cap.pcap [--nintendo] [--channel 7]
   python dslink.py analyze cap.pcap              analyse une capture (sans ESP32)
   python dslink.py replay-beacon --port COM5 cap.pcap [--index 0] [--interval 100]
@@ -34,7 +35,9 @@ SER_CMD_SEND_LINK, SER_CMD_TX_RAW = 0x04, 0x05
 SER_CMD_BEACON_START, SER_CMD_BEACON_STOP = 0x06, 0x07
 SER_EVT_PONG, SER_EVT_RX_LINK, SER_EVT_RX_RAW = 0x80, 0x81, 0x82
 SER_EVT_LOG, SER_EVT_STATS = 0x83, 0x84
-MODE_LINK, MODE_SNIFF, MODE_NINTENDO = 0, 1, 2
+SER_CMD_MP_TX, SER_CMD_MP_CONFIG = 0x08, 0x09       # mode MP_HOST (utilisés par melonDS)
+SER_EVT_MP_REPLY, SER_EVT_MP_WINDOW = 0x85, 0x86
+MODE_LINK, MODE_SNIFF, MODE_NINTENDO, MODE_MP_HOST = 0, 1, 2, 3
 RATE_1M, RATE_2M = 0x0A, 0x14
 LINK_HEADER = struct.Struct("<IBBHH")       # magic, version, node, seq, len
 LINK_MAGIC = 0x4B4E4C44
@@ -95,6 +98,23 @@ def crc16_ccitt(data: bytes) -> int:
     return crc
 
 
+LINK_BSSID = bytes([0x02]) + b"DSLNK"
+
+
+def build_link_payload(node: int, seq: int, data: bytes) -> bytes:
+    """[LinkHeader][données] (miroir de common/linkproto.h)."""
+    data = data[:LINK_MAX_DATA]
+    return LINK_HEADER.pack(LINK_MAGIC, LINK_VERSION, node, seq & 0xFFFF, len(data)) + data
+
+
+def build_air_frame(src_mac: bytes, node: int, seq: int, data: bytes) -> bytes:
+    """Trame 802.11 complète, identique à link_build_air_frame() en C."""
+    s = seq & 0xFFFF
+    hdr = (b"\x08\x00" + b"\x00\x00" + b"\xff" * 6 + bytes(src_mac[:6]) + LINK_BSSID
+           + bytes([(s << 4) & 0xFF, (s >> 4) & 0xFF]))
+    return hdr + build_link_payload(node, s, data)
+
+
 def frame_message(msg_type: int, payload: bytes = b"") -> bytes:
     body = bytes([msg_type]) + payload
     return cobs_encode(body + struct.pack("<H", crc16_ccitt(body))) + b"\x00"
@@ -106,11 +126,14 @@ def frame_message(msg_type: int, payload: bytes = b"") -> bytes:
 class DsLinkBridge:
     """Connexion à l'ESP32. Les événements arrivent dans self.events (Queue)."""
 
+    kind = "radio"                     # transport : DS sur les ondes, via esp32-bridge
+
     def __init__(self, port: str, baud: int = 921600):
         import serial  # import tardif : "analyze" n'en a pas besoin
         self.ser = serial.Serial(port, baud, timeout=0.05)
         self.events: queue.Queue = queue.Queue(maxsize=10000)
         self.bad_frames = 0
+        self.mac: bytes | None = None   # MAC de l'ESP32, apprise par ping()
         self._stop = False
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._reader, daemon=True)
@@ -131,8 +154,16 @@ class DsLinkBridge:
     def set_mode(self, mode: int):     self._send(SER_CMD_SET_MODE, bytes([mode]))
     def beacon_stop(self):             self._send(SER_CMD_BEACON_STOP)
 
-    def send_link(self, data: bytes, node: int = 0):
-        self._send(SER_CMD_SEND_LINK, bytes([node]) + data)
+    def send_link(self, data: bytes, node: int = 0, seq: int | None = None):
+        """Émet un message dslink sur les ondes, au nom du nœud `node`.
+        Sans `seq`, l'ESP32 numérote lui-même. Avec `seq` (hub qui fait suivre
+        le message d'une autre DS), la trame est construite ici avec le numéro
+        d'origine, pour que les DS comptent correctement les pertes."""
+        if seq is None:
+            self._send(SER_CMD_SEND_LINK, bytes([node]) + data)
+        else:
+            src = self.mac or b"\x02\x00\x00\x00\x00\x00"
+            self.tx_raw(build_air_frame(src, node, seq, data))
 
     def tx_raw(self, frame: bytes, rate: int = RATE_2M):
         self._send(SER_CMD_TX_RAW, bytes([rate]) + frame)
@@ -171,6 +202,8 @@ class DsLinkBridge:
             # thread de lecture, qui s'arrêterait sans prévenir.
             self.bad_frames += 1
             return
+        if t == SER_EVT_PONG:
+            self.mac = p[1:7]
         try:
             self.events.put_nowait(ev)
         except queue.Full:
@@ -222,8 +255,13 @@ class DsLinkUdp:
     relay : adresse d'un ESP-Pont ("esp-pont.local", "192.168.1.50" ou
     "hôte:port"). Le PC s'y inscrit par un message vide chaque seconde, et le
     pont relaie alors les DS connectées à son point d'accès, sans PC_IP.
+
+    Ce message vide du nœud 0 part aussi vers chaque DS connue : il lui
+    confirme que le PC est là (ligne « PC connecte » de la démo), même quand
+    le PC n'a rien d'autre à lui dire.
     """
 
+    kind = "udp"                       # transport : melonDS et/ou ESP-Pont
     HELLO_PERIOD = 1.0
 
     def __init__(self, port: int = LINK_UDP_PORT, bind: str = "0.0.0.0",
@@ -242,10 +280,8 @@ class DsLinkUdp:
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
-        self._hello = None
-        if self.relay:
-            self._hello = threading.Thread(target=self._hello_loop, daemon=True)
-            self._hello.start()
+        self._hello = threading.Thread(target=self._hello_loop, daemon=True)
+        self._hello.start()
 
     @staticmethod
     def _resolve(relay: str) -> tuple:
@@ -260,14 +296,22 @@ class DsLinkUdp:
     def close(self):
         self._stop = True
         self._thread.join(timeout=1)
-        if self._hello:
-            self._hello.join(timeout=2)
+        self._hello.join(timeout=2)
         self.sock.close()
 
+    def _dests(self) -> set:
+        d = set(self.peers.values())
+        if self.relay:
+            d.add(self.relay)
+        return d
+
     def _hello_loop(self):
-        """Inscription auprès du relais : message vide du nœud 0, chaque seconde."""
+        """Message vide du nœud 0, chaque seconde : inscription auprès du
+        relais, et signe de présence pour les DS déjà connues."""
         while not self._stop:
-            self._send_to({self.relay}, b"")
+            dests = self._dests()
+            if dests:
+                self._send_to(dests, b"")
             time.sleep(self.HELLO_PERIOD)
 
     # Commandes propres à l'ESP32 : sans objet ici.
@@ -276,18 +320,33 @@ class DsLinkUdp:
     def set_mode(self, mode: int):     pass
     def beacon_stop(self):             pass
 
-    def send_link(self, data: bytes, node: int = 0):
-        """Envoie à toutes les DS découvertes (en-tête node = émetteur = 0, le PC).
-        Via un relais, un seul envoi suffit : ESP-Pont le transmet à chaque DS."""
-        dests = set(self.peers.values())
-        if self.relay:
-            dests.add(self.relay)
-        self._send_to(dests, data[:LINK_MAX_DATA], node)
+    def send_link(self, data: bytes, node: int = 0, seq: int | None = None,
+                  exclude: int | None = None):
+        """Envoie à toutes les DS découvertes. node = émetteur : 0 pour le PC,
+        ou le numéro d'une autre DS quand le hub fait suivre son message (avec
+        son `seq` d'origine). Via un relais, un seul envoi suffit : ESP-Pont le
+        transmet à chaque DS de son point d'accès.
+        exclude : DS à ne pas servir (celle qui a émis le message), sauf si
+        elle est derrière le relais, qui sert aussi les autres DS."""
+        dests = self._dests()
+        skip = self.peers.get(exclude) if exclude is not None else None
+        if skip is not None and skip != self.relay:
+            dests.discard(skip)
+        if dests:
+            self._send_to(dests, data, node, seq)
 
-    def _send_to(self, dests: set, data: bytes, node: int = 0):
+    def send_link_to(self, target: int, data: bytes):
+        """Envoie au nom du PC à une seule DS (ex. réponse à son ping)."""
+        addr = self.peers.get(target)
+        if addr:
+            self._send_to({addr}, data)
+
+    def _send_to(self, dests: set, data: bytes, node: int = 0, seq: int | None = None):
         with self._lock:
-            pkt = LINK_HEADER.pack(LINK_MAGIC, LINK_VERSION, node, self._seq, len(data)) + data
-            self._seq = (self._seq + 1) & 0xFFFF
+            if seq is None:                       # numérotation propre au PC
+                seq = self._seq
+                self._seq = (self._seq + 1) & 0xFFFF
+            pkt = build_link_payload(node, seq, data)
             for addr in dests:
                 try:
                     self.sock.sendto(pkt, addr)
@@ -330,6 +389,84 @@ class DsLinkUdp:
             self.events.put_nowait(ev)
         except queue.Full:
             pass
+
+
+# --------------------------------------------------------------------------
+# Hub : faire jouer ensemble des DS de transports différents
+# --------------------------------------------------------------------------
+class DsLinkHub:
+    """Relie plusieurs transports pour que toutes les DS se parlent :
+
+        vraie DS ~~ondes~~ ESP32 (DsLinkBridge) ─┐
+        vraie DS ~~Wi-Fi~~ ESP-Pont (relais)  ───┤
+        melonDS (DS émulée) ─────────────────────┴─ DsLinkUdp
+
+    Chaque message reçu d'une DS repart vers toutes les autres, avec son
+    numéro de nœud et de séquence d'origine : pour le jeu, c'est comme si les
+    consoles étaient à côté. Seule exception, un message venu des ondes n'y
+    est pas réémis : les DS à portée de l'ESP32 l'ont déjà entendu.
+
+    self.events reçoit les événements de tous les transports, chacun marqué
+    par la clé "bridge". Chaque DS doit avoir un numéro de nœud différent.
+    """
+
+    def __init__(self, bridges: list):
+        self.bridges = bridges
+        self.events: queue.Queue = queue.Queue(maxsize=20000)
+        self.forwarded = 0
+        self._stop = False
+        self._threads = [threading.Thread(target=self._pump, args=(br,), daemon=True)
+                         for br in bridges]
+        for t in self._threads:
+            t.start()
+
+    def _pump(self, br):
+        while not self._stop:
+            try:
+                ev = br.events.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            ev["bridge"] = br
+            if ev["type"] == SER_EVT_RX_LINK:
+                self._forward(br, ev)
+            try:
+                self.events.put_nowait(ev)
+            except queue.Full:
+                pass
+
+    def _forward(self, src, ev):
+        for br in self.bridges:
+            if br is src and br.kind == "radio":
+                continue
+            try:
+                if br.kind == "udp":
+                    br.send_link(ev["data"], node=ev["node"], seq=ev["seq"],
+                                 exclude=ev["node"] if br is src else None)
+                else:
+                    br.send_link(ev["data"], node=ev["node"], seq=ev["seq"])
+                self.forwarded += 1
+            except OSError:
+                pass
+
+    def send_link(self, data: bytes):
+        """Message du PC (nœud 0) vers toutes les DS de tous les transports."""
+        for br in self.bridges:
+            br.send_link(data)
+
+    def reply(self, ev: dict, data: bytes):
+        """Répond, au nom du PC, à la DS qui a émis l'événement ev."""
+        br = ev["bridge"]
+        if br.kind == "udp":
+            br.send_link_to(ev["node"], data)
+        else:
+            br.send_link(data)
+
+    def close(self):
+        self._stop = True
+        for t in self._threads:
+            t.join(timeout=1)
+        for br in self.bridges:
+            br.close()
 
 
 # --------------------------------------------------------------------------
@@ -490,49 +627,78 @@ def wait_pong(br: DsLinkBridge, timeout: float = 3.0):
     return False
 
 
+def demo_pong(ev: dict) -> bytes | None:
+    """Réponse du PC à un message de la démo DS, ou None.
+    'P'[ticks] -> 'p'[ticks][nœud visé] : le nœud visé évite qu'une autre DS,
+    qui reçoit aussi le pong, en tire un faux temps d'aller-retour."""
+    d = ev["data"]
+    if d[:1] == b"P" and len(d) >= 5:
+        return b"p" + d[1:5] + bytes([ev["node"]])
+    return None
+
+
+def open_bridges(a) -> list:
+    """Ouvre les transports demandés : radio (--port) et/ou UDP (--udp, --relay)."""
+    bridges = []
+    try:
+        if a.port:
+            br = DsLinkBridge(a.port, a.baud)
+            bridges.append(br)
+            if not wait_pong(br):
+                raise SystemExit(1)
+            br.set_channel(a.channel)
+            br.set_mode(MODE_LINK)
+            print(f"Radio : canal {a.channel}. Sur les vraies DS de l'ESP32, choisissez A.")
+        if a.udp or a.relay:
+            br = DsLinkUdp(a.udp_port, relay=a.relay)
+            bridges.append(br)
+            print(f"Réseau : écoute UDP sur le port {br.port}. Dans melonDS, choisissez B.")
+            if br.relay:
+                print(f"Inscription auprès d'ESP-Pont {br.relay[0]}:{br.relay[1]}. "
+                      "Sur les vraies DS d'ESP-Pont, choisissez B.")
+    except BaseException:
+        for br in bridges:
+            br.close()
+        raise
+    if not bridges:
+        raise SystemExit("Indiquez --port COMx (pont radio ESP32), --udp (melonDS), "
+                         "--relay esp-pont.local (ESP-Pont), ou plusieurs à la fois.")
+    return bridges
+
+
 def cmd_demo(a):
-    if a.udp or a.relay:
-        br = DsLinkUdp(a.udp_port, relay=a.relay)
-        print(f"Mode réseau : écoute UDP sur le port {br.port}.")
-        if br.relay:
-            print(f"Inscription auprès d'ESP-Pont {br.relay[0]}:{br.relay[1]}.")
-        print("Lancez la démo sur la DS (ou dans melonDS) et choisissez B.")
-    elif a.port:
-        br = DsLinkBridge(a.port, a.baud)
-        if not wait_pong(br):
-            return
-        br.set_channel(a.channel)
-        br.set_mode(MODE_LINK)
-    else:
-        raise SystemExit("Indiquez --port COMx (pont ESP32), --udp (melonDS) "
-                         "ou --relay esp-pont.local (vraie DS + ESP-Pont).")
-    print("Tapez un texte + Entrée pour l'envoyer à la DS. Ctrl+C pour quitter.\n")
+    hub = DsLinkHub(open_bridges(a))
+    if len(hub.bridges) > 1:
+        print("Hub actif : les DS des différents transports jouent ensemble.")
+    print("Tapez un texte + Entrée pour l'envoyer aux DS. Ctrl+C pour quitter.\n")
 
     def stdin_loop():
         for line in sys.stdin:
-            br.send_link(b"T" + line.strip().encode()[:63])
+            hub.send_link(b"T" + line.strip().encode()[:63])
     threading.Thread(target=stdin_loop, daemon=True).start()
 
     last_state: dict[int, tuple] = {}
     try:
         while True:
-            ev = br.events.get()
+            ev = hub.events.get()
             if ev["type"] == SER_EVT_RX_LINK:
                 d = ev["data"]
-                if d[:1] == b"P":                      # ping -> pong immédiat
-                    br.send_link(b"p" + d[1:5])
+                pong = demo_pong(ev)
+                if pong:
+                    hub.reply(ev, pong)
                 elif d[:1] == b"S" and len(d) >= 9:
                     keys, frame = struct.unpack_from("<II", d, 1)
                     if last_state.get(ev["node"], (None,))[0] != keys:
-                        print(f"DS{ev['node']}  touches=0x{keys:04X}  image={frame}  "
-                              f"rssi={ev['rssi']} dBm")
+                        where = (f"rssi={ev['rssi']} dBm" if ev["bridge"].kind == "radio"
+                                 else f"via {ev['addr'][0]}:{ev['addr'][1]}")
+                        print(f"DS{ev['node']}  touches=0x{keys:04X}  image={frame}  {where}")
                     last_state[ev["node"]] = (keys, frame)
             elif ev["type"] == SER_EVT_LOG:
-                print(f"[esp32] {ev['text']}")
+                print(f"[{ev['bridge'].kind}] {ev['text']}")
     except KeyboardInterrupt:
         pass
     finally:
-        br.close()
+        hub.close()
 
 
 def cmd_sniff(a):

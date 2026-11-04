@@ -13,6 +13,7 @@ voir le [README](README.md).
 | seulement un PC | **A — melonDS** | aucun | facile |
 | une vraie DS et un ESP8266 ou un ESP32 | **B — ESP-Pont** (recommandé) | carte ESP, câble USB | moyenne |
 | une vraie DS et un ESP32, latence minimale | **C — pont radio** | ESP32 branché en USB au PC | avancée |
+| des vraies DS **et** melonDS qui jouent ensemble | **D — hub** (A + B ou C) | celui de B ou C | moyenne |
 
 Les étapes 1 et 2 sont communes à tous les parcours. Faites-les, puis passez directement à la
 section de votre parcours.
@@ -50,20 +51,50 @@ Le dépôt ne contient pas la démo compilée : il faut la construire avec **Blo
 compilation homebrew pour DS. La documentation officielle est ici :
 https://blocksds.skylyrac.net/docs/setup/
 
-**Le plus simple sous Windows : Docker.** Installez Docker Desktop, puis, dans le dossier du projet :
+**Sous Windows, sans Docker ni WSL (méthode testée) :**
+
+1. Installez MSYS2, dans un PowerShell :
+   ```powershell
+   winget install --id MSYS2.MSYS2 -e
+   ```
+2. Ouvrez le terminal **« MSYS2 MSYS »** (menu Démarrer) et mettez-le à jour. Lancez la commande
+   deux fois : la première met à jour le cœur de MSYS2.
+   ```bash
+   pacman -Syu
+   pacman -S --needed make tar wget
+   ```
+3. Installez Wonderful Toolchain, puis BlocksDS :
+   ```bash
+   mkdir -p /opt/wonderful && cd /tmp
+   wget https://wonderful.asie.pl/bootstrap/wf-bootstrap-windows-x86_64.tar.gz
+   tar xzf wf-bootstrap-windows-x86_64.tar.gz -C /opt/wonderful
+   export PATH=/opt/wonderful/bin:$PATH
+   wf-pacman -Syu            # deux fois si on vous demande de relancer wf-pacman
+   wf-pacman -S wf-tools
+   wf-config repo enable blocksds
+   wf-pacman -Syu
+   wf-pacman -S blocksds-toolchain
+   ```
+4. Compilez, toujours dans le terminal MSYS2 :
+   ```bash
+   cd /c/Users/<vous>/Documents/ds-pc-link/ds-homebrew
+   make
+   ```
+
+**Sous Linux ou WSL**, mêmes étapes 3 et 4 avec l'archive de Wonderful pour Linux (voir la doc
+officielle).
+
+**Avec Docker**, dans le dossier du projet :
 ```bash
 docker run --rm -v "%cd%":/work -w /work/ds-homebrew skylyrac/blocksds:slim-latest make
 ```
 (sous PowerShell, remplacez `%cd%` par `${PWD}`).
 
-**Sous Linux ou WSL**, installez BlocksDS avec le gestionnaire de Wonderful Toolchain en suivant
-la doc officielle, puis :
-```bash
-cd ds-homebrew
-make
-```
-Le Makefile cherche BlocksDS dans `/opt/blocksds/core`. S'il est ailleurs :
-`make BLOCKSDS=/chemin/vers/blocksds/core`.
+Le Makefile trouve seul BlocksDS dans `/opt/wonderful/thirdparty/blocksds/core` (Wonderful) ou
+`/opt/blocksds/core`. S'il est ailleurs : `make BLOCKSDS=/chemin/vers/blocksds/core`.
+
+> Avec une version récente de BlocksDS, `Wifi_Update()` n'existe plus côté DS : la bibliothèque
+> Wi-Fi se met à jour seule. Ne l'appelez pas dans vos jeux.
 
 Résultat : `ds-homebrew/dslink_demo.nds`.
 
@@ -214,6 +245,31 @@ N'utilisez pas `idf.py monitor` : le port série transporte un protocole binaire
    ```
    Le terminal doit afficher `ESP32 OK — firmware v1`.
 3. Lancez `dslink_demo.nds` sur la DS et appuyez sur **A** (radio directe).
+
+---
+
+## D. Vraies DS et melonDS ensemble (hub)
+
+C'est la combinaison des parcours précédents : des vraies DS (parcours B ou C) et des DS dans
+melonDS (parcours A) jouent ensemble, le PC faisant suivre les messages des unes aux autres.
+
+1. Préparez chaque partie comme dans son parcours (ESP32 flashé, ESP-Pont configuré, melonDS
+   réglé).
+2. Compilez **une démo par console**, chacune avec un `NODE` différent dans
+   `ds-homebrew/source/main.c` (1, 2, 3…). Gardez par exemple `NODE 1` pour la vraie DS et
+   `NODE 2` pour melonDS.
+3. Lancez le PC avec tous les transports utilisés :
+   ```bash
+   python pc-host/dslink.py demo --port COM5 --udp               # pont radio + melonDS
+   python pc-host/dslink.py demo --relay esp-pont.local          # ESP-Pont + melonDS
+   ```
+   ou, dans `dslink_gui.py`, onglet *Liaison DS* : cochez les deux transports.
+4. Lancez la démo sur chaque console : **A** sur les vraies DS du pont radio, **B** sur celles
+   d'ESP-Pont et dans melonDS.
+5. Sur chaque écran, la section « autres DS » montre les touches tenues par les autres consoles.
+
+Le hub ne sert qu'aux jeux qui utilisent `dslink`. Il ne fait pas jouer une cartouche d'origine
+ni le « salon Wi-Fi local » de Void Crew avec melonDS (voir le README).
 
 ---
 

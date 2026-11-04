@@ -1,0 +1,47 @@
+--- a/src/net/MPInterface.h
++++ b/src/net/MPInterface.h
+@@ -32,6 +32,7 @@
+     MPInterface_Local,
+     MPInterface_LAN,
+     MPInterface_Netplay,
++    MPInterface_ESP32,      // ds-pc-link : radio d'un ESP32, avec de vraies DS
+ };
+
+ struct MPPacketHeader
+--- a/src/net/MPInterface.cpp
++++ b/src/net/MPInterface.cpp
+@@ -19,6 +19,7 @@
+ #include "MPInterface.h"
+ #include "LocalMP.h"
+ #include "LAN.h"
++#include "ESP32MP.h"
+
+ namespace melonDS
+ {
+@@ -47,8 +48,17 @@
+
+ void MPInterface::Set(MPInterfaceType type)
+ {
++    // ds-pc-link : avec MELONDS_ESP32_PORT, le multijoueur « local » passe
++    // par la radio d'un ESP32, pour jouer avec de vraies DS.
++    if (type == MPInterface_Local && ESP32MP::Configured())
++        type = MPInterface_ESP32;
++
+     switch (type)
+     {
++    case MPInterface_ESP32:
++        Current = std::make_unique<ESP32MP>();
++        break;
++
+     case MPInterface_Local:
+         Current = std::make_unique<LocalMP>();
+         break;
+--- a/src/net/CMakeLists.txt
++++ b/src/net/CMakeLists.txt
+@@ -10,5 +10,6 @@
+     Netplay.cpp
+     MPInterface.cpp
++    ESP32MP.cpp
+ )
+
+ target_include_directories(net-utils PUBLIC

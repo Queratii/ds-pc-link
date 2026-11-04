@@ -87,14 +87,20 @@ void relayLoop() {
 
     IPAddress from = udp.remoteIP();
     uint16_t  port = udp.remotePort();
+    bool fromPc = g_pc.on && from == g_pc.ip && port == g_pc.port;
 
-    if (node == 0) {
-      /* Le PC : il s'inscrit (ou se reinscrit) a chaque message, y compris
-       * les messages vides de maintien. Tout est transmis aux DS, ce qui
-       * leur indique aussi que le PC est present. */
-      g_pc.ip = from; g_pc.port = port; g_pc.seen = now; g_pc.on = true;
+    if (node == 0 || fromPc) {
+      /* Le PC. Un message du noeud 0 l'inscrit (ou le reinscrit), y compris
+       * les messages vides de maintien envoyes chaque seconde. Il peut aussi
+       * faire suivre, sous leur propre numero, les messages d'autres DS
+       * (hub : vraies DS du pont radio, DS emulees dans melonDS) : on les
+       * reconnait a l'adresse du PC. Tout est transmis aux DS du point
+       * d'acces, sauf a celle dont le message est l'echo. */
+      if (node == 0) {
+        g_pc.ip = from; g_pc.port = port; g_pc.seen = now; g_pc.on = true;
+      }
       for (int i = 1; i < MAX_NODES; i++)
-        if (g_ds[i].on) sendTo(g_ds[i], g_buf, n);
+        if (g_ds[i].on && i != node) sendTo(g_ds[i], g_buf, n);
     } else {
       /* Une DS. Sans adresse de PC, elle envoie chaque message a la fois a
        * sa passerelle et en broadcast : l'ESP peut recevoir deux copies. */

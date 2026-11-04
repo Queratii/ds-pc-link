@@ -19,6 +19,7 @@ Le kit couvre deux situations très différentes :
 | État du kit | **fonctionnel de bout en bout** | **outils de phase 1** : capture, analyse, rejeu de beacon |
 | Difficulté | quelques soirées | projet de recherche |
 | Émulateur melonDS | oui, en **mode réseau** (UDP via melonAP, sans ESP32) | non |
+| Vraies DS + melonDS ensemble | oui, avec le **hub** du PC (vraies DS via un ESP32) | **expérimental** : melonDS hôte, vraies DS clientes ([melonds-esp32/](melonds-esp32/README.md)) |
 
 ---
 
@@ -34,6 +35,7 @@ pc-host/dslink_gui.py     interface graphique (Tkinter) de toutes ces fonctions 
 tests/                    tests hors matériel (C <-> Python, pcap, analyseur)
 esp-pont/                 ESP-Pont : point d'accès ouvert 802.11b routé + relais dslink (Arduino)
 homebrews/VoidCrew.nds    jeu homebrew Wi-Fi (BlocksDS), prêt à lancer sur la DS
+melonds-esp32/            interface ESP32 pour melonDS : multijoueur natif avec de vraies DS
 ```
 
 Le kit propose deux ESP différents : `esp32-bridge/` pour la **radio directe** (trames brutes,
@@ -109,7 +111,6 @@ Plusieurs DS : changez `NODE` (1 à 15) dans `ds-homebrew/source/main.c` pour ch
 ```c
 dslink_init(7, MON_NUMERO_DE_JOUEUR);
 // à chaque image :
-Wifi_Update();
 dslink_send(&mon_etat, sizeof mon_etat);
 DsLinkMsg m;
 while (dslink_poll(&m)) traiter(m.node, m.data, m.len);
@@ -194,6 +195,41 @@ Par rapport à la radio directe, ce mode ajoute quelques secondes de connexion (
 et un peu de latence, mais n'impose aucune contrainte de canal, et il n'utilise que des API Wi-Fi
 standard de la DS.
 
+### Jouer ensemble : vraies DS et melonDS (hub)
+
+```
+ vraie DS ~~ondes~~ ESP32 (esp32-bridge) ==USB==┐
+ vraie DS ~~Wi-Fi~~ ESP-Pont (relais) ~~box~~───┼── PC : hub ── melonDS (DS émulées)
+                                                └── chaque message d'une DS repart vers toutes les autres
+```
+
+C'est le but du projet. Quand plusieurs transports sont ouverts à la fois, le PC fait suivre chaque
+message d'une DS à toutes les autres, avec son numéro de nœud et de séquence d'origine. Pour le
+jeu, les consoles sont comme côte à côte, qu'elles soient vraies ou émulées.
+
+```bash
+# vraies DS par le pont radio + DS dans melonDS
+python pc-host/dslink.py demo --port COM5 --udp
+# vraies DS par ESP-Pont + DS dans melonDS (le relais implique l'UDP)
+python pc-host/dslink.py demo --relay esp-pont.local
+# les trois à la fois
+python pc-host/dslink.py demo --port COM5 --relay esp-pont.local
+```
+Ou dans l'interface graphique : onglet *Liaison DS*, les deux transports cochés.
+
+- Chaque console doit avoir un **`NODE` différent** (1 à 15) : une démo compilée par console.
+- Dans la démo, la section « autres DS » affiche les touches tenues par les autres consoles.
+  Appuyez sur une touche d'une vraie DS, elle s'affiche dans melonDS, et inversement.
+- Dans vos jeux, rien de plus à écrire : `dslink_poll()` reçoit les messages des autres DS avec
+  leur numéro de nœud (`m.node`), quel que soit leur transport.
+- Le hub ne réémet pas sur les ondes les messages qui en viennent : les DS à portée de l'ESP32
+  s'entendent déjà directement.
+
+**Ce que le hub ne fait pas :** il ne fonctionne qu'avec les jeux qui utilisent `dslink`. Les
+cartouches d'origine et le multijoueur local de DSWiFi (le « salon Wi-Fi local » de Void Crew,
+par exemple) emploient le protocole multijoueur de Nintendo. Pour eux, voir la partie 2 :
+[melonDS hôte avec de vraies DS](#melonds-hôte-avec-de-vraies-ds-expérimental).
+
 ### Jeu fourni : Void Crew
 
 `homebrews/VoidCrew.nds` est un jeu homebrew compilé avec BlocksDS, qui propose des salons
@@ -227,6 +263,31 @@ Le PC, derrière une liaison USB, est trop lent pour tenir ces créneaux. La cou
 tourner **sur l'ESP32** ; le PC ne fournit que les données de jeu, en avance. C'est faisable mais
 incertain, d'où la feuille de route par phases.
 
+### melonDS hôte avec de vraies DS (expérimental)
+
+```
+ melonDS (DS hôte émulée) ==USB== ESP32 (esp32-bridge, MODE_MP_HOST) ~~802.11b~~ vraies DS
+```
+
+C'est l'usage le plus direct de ces phases : **jouer en multijoueur natif entre l'émulateur et de
+vraies DS**, avec n'importe quel jeu qui le gère. melonDS émule la DS hôte, et l'ESP32 lui prête sa
+radio. Ce cas est favorable : après chaque CMD, melonDS *attend* les réponses (jusqu'à 25 ms),
+donc le délai de l'USB est absorbé par l'émulateur et non par les vraies DS. L'ESP32 prend
+l'adresse MAC de l'hôte émulé, ce qui permet à sa radio d'acquitter d'elle-même les trames des
+clientes. Il émet les trames de melonDS et lui transmet les réponses reçues dans la fenêtre qui
+suit chaque CMD.
+
+- Firmware : `esp32-bridge`, mode `MODE_MP_HOST` (rien à régler, melonDS l'active).
+- Émulateur : melonDS avec l'interface `ESP32MP`, dans [melonds-esp32/](melonds-esp32/README.md)
+  (un patch et deux fichiers, avec un script qui récupère melonDS, l'adapte et le compile).
+- Lancement : `MELONDS_ESP32_PORT=COM5`, puis melonDS ; créez la partie dans melonDS et
+  rejoignez-la depuis les vraies DS.
+
+**Jamais testé sur du matériel.** [melonds-esp32/README.md](melonds-esp32/README.md#ce-qui-peut-échouer)
+détaille ce qui peut échouer, à commencer par l'ACK, qui part plus tard que sur une vraie DS.
+Le cas inverse (vraie DS hôte, melonDS client) n'est pas réalisé : il demanderait que l'ESP32
+réponde seul aux CMD dans le créneau.
+
 ### Phase 1 — Observer (outils fournis)
 
 Faites jouer **deux vraies DS** ensemble, et capturez :
@@ -253,24 +314,26 @@ Si la DS cliente liste la partie et tente de rejoindre, l'outil affiche ses tram
 (authentification, association). **C'est le premier vrai jalon** : il prouve que la DS accepte
 l'ESP32 comme hôte au niveau radio.
 
-### Phase 3 — Accepter un client (à écrire)
+### Phase 3 — Accepter un client (écrit, à tester)
 
-Répondre à l'authentification et à l'association de la DS, en s'appuyant sur les échanges capturés
-entre deux vraies DS. Pas de contrainte de timing serrée à ce stade.
+Répondre à l'authentification et à l'association de la DS. Avec melonDS hôte, c'est l'émulateur
+qui fabrique ces réponses, et l'ESP32 qui les émet ; reste à vérifier sur le matériel que sa radio
+acquitte bien les trames des clientes.
 
-### Phase 4 — Boucle MP sur l'ESP32 (à écrire, le cœur du problème)
+### Phase 4 — Boucle MP (écrite pour melonDS hôte, à tester)
 
-Implémenter sur l'ESP32 la boucle hôte : émettre la trame CMD à la cadence observée, recevoir les
-réponses, émettre l'ACK. Le PC envoie les données de jeu **avant** qu'elles soient nécessaires,
-l'ESP32 les tient dans un tampon. Les mesures de la phase 1 diront si la latence d'émission de
-`esp_wifi_80211_tx()` est acceptable. Être **hôte** est plus favorable que client, car c'est l'hôte
-qui fixe le rythme.
+Émettre la trame CMD, recevoir les réponses, émettre l'ACK. Avec melonDS hôte, l'émulateur
+cadence la boucle et l'ESP32 recueille les réponses dans une fenêtre après chaque CMD. Si l'ACK
+de melonDS arrive trop tard pour les clientes, il faudra que l'ESP32 l'émette lui-même en fin de
+fenêtre. Pour un **hôte autonome** (sans émulateur), il faudrait en plus faire tourner la boucle
+entière sur l'ESP32.
 
 ### Phase 5 — Protocole du jeu
 
-Décoder ce que le jeu met dans les trames MP. Si votre port PC provient d'une décompilation du jeu,
-le code réseau d'origine vous le donne directement ; sinon, il faut le rétro-ingénierer à partir des
-captures.
+Décoder ce que le jeu met dans les trames MP : nécessaire seulement pour un hôte autonome ou un
+portage PC. Avec melonDS, c'est le jeu émulé lui-même qui produit et lit ces données. Si votre
+port PC provient d'une décompilation du jeu, le code réseau d'origine vous le donne
+directement ; sinon, il faut le rétro-ingénierer à partir des captures.
 
 ### Si l'ESP32 ne suffit pas
 

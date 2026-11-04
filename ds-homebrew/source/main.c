@@ -1,10 +1,14 @@
 // Démo dslink : la DS envoie son état (boutons) et mesure la latence vers le PC.
 //
 // Messages applicatifs (1er octet = type) :
-//   'S' état   : [keys u32][frame u32]                 DS -> PC
+//   'S' état   : [keys u32][frame u32]                 DS -> PC, et vers les autres DS
 //   'P' ping   : [ticks u32]                           DS -> PC (le PC renvoie 'p')
-//   'p' pong   : [ticks u32]                           PC -> DS
+//   'p' pong   : [ticks u32][nœud visé u8]             PC -> DS
 //   'T' texte  : [chaîne]                              PC -> DS
+//
+// Le hub du PC (dslink.py demo avec plusieurs transports) fait suivre l'état
+// de chaque DS aux autres : vraies DS et DS émulées dans melonDS voient leurs
+// touches respectives, comme dans un jeu multijoueur.
 //
 // Au démarrage, choix du transport :
 //   A = radio directe (vraie DS + pont ESP32)
@@ -78,9 +82,14 @@ int main(void)
     char last_text[33] = "";
     uint32_t last_rtt_us = 0;
 
+    // État des autres consoles, reçu via le hub du PC
+    uint32_t peer_keys[16] = { 0 };
+    uint32_t peer_seen[16] = { 0 };   // image de la dernière réception (0 = jamais)
+
     for (;;) {
         swiWaitForVBlank();
-        Wifi_Update();
+        // Pas de Wifi_Update() : les versions récentes de DSWiFi (BlocksDS)
+        // l'ont retirée côté ARM9, la bibliothèque se met à jour seule.
         scanKeys();
         uint32_t held = keysHeld(), down = keysDown();
         if (down & KEY_START) break;
@@ -106,9 +115,16 @@ int main(void)
             if (msg.len == 0) continue;
             switch (msg.data[0]) {
             case 'p':
-                if (msg.len >= 5) {
+                // Le pong vise une DS : ignorer celui d'une autre console
+                if (msg.len >= 5 && (msg.len < 6 || msg.data[5] == NODE)) {
                     uint32_t dt = cpuGetTiming() - get_u32(msg.data + 1);
                     last_rtt_us = (uint32_t)((uint64_t)dt * 1000 / 33514);
+                }
+                break;
+            case 'S':
+                if (msg.len >= 9 && msg.node >= 1 && msg.node <= 15) {
+                    peer_keys[msg.node] = get_u32(msg.data + 1);
+                    peer_seen[msg.node] = frame;
                 }
                 break;
             case 'T': {
@@ -130,6 +146,24 @@ int main(void)
             printf("RX ok %-6lu  perdus %-4lu\n", (unsigned long)st.rx_ok, (unsigned long)st.rx_lost);
             printf("RTT  %-6lu us          \n", (unsigned long)last_rtt_us);
             printf("PC: %-28s\n", last_text);
+
+            // Autres consoles (au plus 5 lignes) : leurs touches tenues
+            printf("-- autres DS --------------------\n");
+            int shown = 0;
+            for (int n = 1; n <= 15 && shown < 5; n++) {
+                if (n == NODE || peer_seen[n] == 0) continue;
+                bool live = frame - peer_seen[n] < 120;          // < 2 s
+                uint32_t k = peer_keys[n];
+                printf("DS%-2d %s %c%c%c%c %c%c%c%c %c%c   \n", n,
+                       live ? "ok  " : "muet",
+                       (k & KEY_A) ? 'A' : '.', (k & KEY_B) ? 'B' : '.',
+                       (k & KEY_X) ? 'X' : '.', (k & KEY_Y) ? 'Y' : '.',
+                       (k & KEY_UP) ? '^' : '.', (k & KEY_DOWN) ? 'v' : '.',
+                       (k & KEY_LEFT) ? '<' : '.', (k & KEY_RIGHT) ? '>' : '.',
+                       (k & KEY_L) ? 'L' : '.', (k & KEY_R) ? 'R' : '.');
+                shown++;
+            }
+            if (shown == 0) printf("aucune pour l'instant           \n");
         }
     }
     return 0;

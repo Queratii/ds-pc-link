@@ -5,6 +5,8 @@
 //   MODE_LINK     : homebrew — ne remonte que nos trames (BSSID 02:44:53:4C:4E:4B)
 //   MODE_SNIFF    : capture brute de tout le canal (pour Wireshark)
 //   MODE_NINTENDO : capture filtrée sur le multijoueur Nintendo (cartouches d'origine)
+//   MODE_MP_HOST  : multijoueur natif, l'ESP32 sert de radio à une DS hôte émulée
+//                   par melonDS (voir melonds-esp32/ et common/linkproto.h)
 //
 // Côté PC : pc-host/dslink.py (voir README).
 
@@ -51,13 +53,41 @@ static uint8_t  g_beacon[512];
 static volatile uint16_t g_beacon_len;
 static volatile uint16_t g_beacon_ms;
 
+// MODE_MP_HOST : fenêtre de réponses ouverte par chaque CMD de l'hôte émulé
+static volatile bool     g_win_open;
+static volatile uint32_t g_win_start;        // horodatage µs (32 bits) de l'émission de la CMD
+static volatile uint16_t g_win_us = MP_DEFAULT_WINDOW_US;
+static volatile uint8_t  g_win_id;           // n° de la CMD, donné par le PC
+static uint8_t           g_win_count;        // réponses remontées dans la fenêtre courante
+static volatile uint32_t st_late;            // réponses arrivées hors fenêtre
+static SemaphoreHandle_t g_win_lock;         // ouverture / clôture de fenêtre (2 tâches)
+
 typedef struct __attribute__((packed)) {
     int8_t   rssi;
     uint8_t  channel;
+    uint8_t  rate;         // RATE_1M / RATE_2M
     uint32_t ts_us;
     uint16_t len;          // sans FCS
     uint8_t  frame[];
 } rx_item_t;
+
+static void wifi_start_promisc(void);
+
+// --------------------------------------------------------------------------
+// Émission de trames de gestion arbitraires
+// --------------------------------------------------------------------------
+// Le firmware Wi-Fi d'Espressif refuse d'émettre par esp_wifi_80211_tx() les
+// trames d'authentification et d'association, indispensables pour accepter
+// une DS cliente en mode MP_HOST. Cette vérification est faite par la fonction
+// ci-dessous de libnet80211 ; on la remplace par une version qui accepte tout
+// (édition de liens avec -zmuldefs, voir main/CMakeLists.txt : notre
+// définition, liée avant la bibliothèque, l'emporte).
+// N'émettez que les trames d'un jeu que vous émulez, sur votre propre réseau.
+int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3)
+{
+    (void)arg; (void)arg2; (void)arg3;
+    return 0;
+}
 
 // --------------------------------------------------------------------------
 // Série : écriture d'une trame [type][payload][crc16] en COBS + 0x00
@@ -116,6 +146,17 @@ static bool frame_wanted(const uint8_t *f, size_t len)
             return true;
         return false;
     }
+
+    case MODE_MP_HOST: {
+        // Le réseau de l'hôte émulé : son BSSID est notre MAC (empruntée).
+        if (len < 24) return false;
+        const uint8_t *a1 = f + 4, *a2 = f + 10, *a3 = f + 16;
+        if (!memcmp(a2, g_mac, 6)) return false;              // écho de nos émissions
+        if (is_nintendo_mp_reply(a1)) return true;            // réponses des clientes
+        if (!memcmp(a1, g_mac, 6) || !memcmp(a3, g_mac, 6)) return true;
+        if (f[0] == 0x40) return true;                        // probe request
+        return false;
+    }
     }
     return false;
 }
@@ -136,6 +177,7 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     }
     it->rssi    = pkt->rx_ctrl.rssi;
     it->channel = pkt->rx_ctrl.channel;
+    it->rate    = pkt->rx_ctrl.rate == 0 ? RATE_1M : RATE_2M;   // 0 = 1 Mbit/s en 802.11b
     it->ts_us   = (uint32_t)esp_timer_get_time();
     it->len     = len;
     memcpy(it->frame, pkt->payload, len);
@@ -143,13 +185,58 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     st_rx++;
 }
 
+// MODE_MP_HOST : clôt la fenêtre de réponses et le signale au PC.
+// Appelant : détient g_win_lock.
+static void mp_window_close_locked(void)
+{
+    if (!g_win_open) return;
+    g_win_open = false;
+    uint8_t ev[6] = { g_win_id, g_win_count };
+    uint32_t late = st_late;
+    memcpy(ev + 2, &late, 4);
+    ser_send(SER_EVT_MP_WINDOW, ev, sizeof ev, NULL, 0);
+}
+
+// Clôt la fenêtre une fois son délai écoulé. Une marge de 2 ms couvre le
+// trajet des trames dans le ring.
+static void mp_window_check(void)
+{
+    if (!g_win_open) return;
+    if ((int32_t)((uint32_t)esp_timer_get_time() - g_win_start) < (int32_t)g_win_us + 2000) return;
+    xSemaphoreTake(g_win_lock, portMAX_DELAY);
+    mp_window_close_locked();
+    xSemaphoreGive(g_win_lock);
+}
+
 // Tâche : vide le ring vers le PC
 static void uplink_task(void *arg)
 {
     for (;;) {
         size_t sz;
-        rx_item_t *it = xRingbufferReceive(g_rx_ring, &sz, portMAX_DELAY);
-        if (!it) continue;
+        // Fenêtre MP ouverte : on se réveille chaque milliseconde pour la clore à temps.
+        TickType_t wait = g_win_open ? pdMS_TO_TICKS(1) : pdMS_TO_TICKS(10);
+        rx_item_t *it = xRingbufferReceive(g_rx_ring, &sz, wait);
+        if (!it) { mp_window_check(); continue; }
+
+        if (g_mode == MODE_MP_HOST && is_nintendo_mp_reply(it->frame + 4)) {
+            xSemaphoreTake(g_win_lock, portMAX_DELAY);
+            int32_t age = (int32_t)(it->ts_us - g_win_start);
+            if (g_win_open && age >= 0 && age <= (int32_t)g_win_us) {
+                uint8_t pre[7];
+                pre[0] = g_win_id;
+                pre[1] = (uint8_t)it->rssi;
+                pre[2] = it->rate;
+                memcpy(pre + 3, &it->ts_us, 4);
+                ser_send(SER_EVT_MP_REPLY, pre, sizeof pre, it->frame, it->len);
+                g_win_count++;
+            } else {
+                st_late++;
+            }
+            xSemaphoreGive(g_win_lock);
+            vRingbufferReturnItem(g_rx_ring, it);
+            mp_window_check();
+            continue;
+        }
 
         if (g_mode == MODE_LINK) {
             LinkHeader h; const uint8_t *d;
@@ -167,6 +254,7 @@ static void uplink_task(void *arg)
             ser_send(SER_EVT_RX_RAW, pre, sizeof pre, it->frame, it->len);
         }
         vRingbufferReturnItem(g_rx_ring, it);
+        mp_window_check();
     }
 }
 
@@ -184,6 +272,62 @@ static void radio_tx(const uint8_t *frame, size_t len, uint8_t rate)
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, false);
     xSemaphoreGive(g_tx_lock);
     if (err == ESP_OK) st_tx++; else st_txerr++;
+}
+
+// MODE_MP_HOST : l'ESP32 prend l'adresse MAC de la DS hôte émulée. Sa radio
+// acquitte alors d'elle-même (en quelques µs) les trames que les clientes
+// adressent à l'hôte, ce qu'aucun logiciel ne pourrait faire à temps.
+// Le changement d'adresse impose d'arrêter puis de relancer le Wi-Fi.
+static void mp_set_mac(const uint8_t mac[6])
+{
+    if (mac[0] & 0x01) return;                       // une MAC de groupe est refusée
+    xSemaphoreTake(g_tx_lock, portMAX_DELAY);
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_stop();
+    esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, mac);
+    wifi_start_promisc();
+    xSemaphoreGive(g_tx_lock);
+
+    char buf[64];
+    if (err == ESP_OK) {
+        memcpy(g_mac, mac, 6);
+        snprintf(buf, sizeof buf, "mp: MAC %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        snprintf(buf, sizeof buf, "mp: changement de MAC refuse (%d)", (int)err);
+    }
+    ser_log(buf);
+}
+
+// MODE_MP_HOST : émet une trame de la DS hôte émulée (format "trame DS").
+static void mp_tx(uint8_t flags, uint8_t id, const uint8_t *h, size_t n)
+{
+    if (n < DS_HW_HDR_LEN + 24 + 4) return;
+    uint8_t  rate = h[8], chan = h[9];
+    uint16_t flen = (uint16_t)(h[10] | (h[11] << 8));          // FCS compris
+    if (flen < 24 + 4 || DS_HW_HDR_LEN + (size_t)flen > n) return;
+    const uint8_t *frame = h + DS_HW_HDR_LEN;
+    size_t len = flen - 4;                                      // la radio ajoute le FCS
+
+    if (chan >= 1 && chan <= 13 && chan != g_channel) {
+        g_channel = chan;
+        esp_wifi_set_channel(g_channel, WIFI_SECOND_CHAN_NONE);
+    }
+    if (memcmp(frame + 10, g_mac, 6) != 0) mp_set_mac(frame + 10);
+
+    if (flags & MP_TX_CMD) {
+        // Ouvrir la fenêtre AVANT d'émettre : une cliente rapide ne doit pas
+        // répondre avant que l'ESP32 l'attende. La fenêtre précédente, si
+        // elle est encore ouverte, est close et signalée d'abord.
+        xSemaphoreTake(g_win_lock, portMAX_DELAY);
+        mp_window_close_locked();
+        g_win_id    = id;
+        g_win_count = 0;
+        g_win_start = (uint32_t)esp_timer_get_time();
+        g_win_open  = true;
+        xSemaphoreGive(g_win_lock);
+    }
+    radio_tx(frame, len, rate == RATE_1M ? RATE_1M : RATE_2M);
 }
 
 static void send_link(uint8_t node, const uint8_t *data, uint16_t len)
@@ -232,9 +376,10 @@ static void handle_cmd(const uint8_t *m, size_t n)
         }
         break;
     case SER_CMD_SET_MODE:
-        if (pl >= 1 && p[0] <= MODE_NINTENDO) {
+        if (pl >= 1 && p[0] <= MODE_MP_HOST) {
             g_mode = p[0];
             g_host_known = false;
+            g_win_open = false;
             snprintf(buf, sizeof buf, "mode %u", g_mode);
             ser_log(buf);
         }
@@ -257,6 +402,17 @@ static void handle_cmd(const uint8_t *m, size_t n)
     case SER_CMD_BEACON_STOP:
         g_beacon_ms = 0;
         ser_log("beacon: arrêt");
+        break;
+    case SER_CMD_MP_TX:
+        if (pl >= 2 && g_mode == MODE_MP_HOST) mp_tx(p[0], p[1], p + 2, pl - 2);
+        break;
+    case SER_CMD_MP_CONFIG:
+        if (pl >= 2) {
+            uint16_t us = (uint16_t)(p[0] | (p[1] << 8));
+            if (us >= 200) g_win_us = us;
+            snprintf(buf, sizeof buf, "mp: fenetre de reponses %u us", g_win_us);
+            ser_log(buf);
+        }
         break;
     }
 }
@@ -300,6 +456,24 @@ static void stats_task(void *arg)
 // --------------------------------------------------------------------------
 // Initialisation
 // --------------------------------------------------------------------------
+
+// Démarre la radio en écoute libre sur g_channel (au démarrage, et après un
+// changement d'adresse MAC en mode MP_HOST).
+static void wifi_start_promisc(void)
+{
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);   // la DS est en 802.11b
+    esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(promisc_cb);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(g_channel, WIFI_SECOND_CHAN_NONE);
+}
+
 void app_main(void)
 {
     esp_err_t e = nvs_flash_init();
@@ -321,6 +495,7 @@ void app_main(void)
 
     g_uart_lock = xSemaphoreCreateMutex();
     g_tx_lock   = xSemaphoreCreateMutex();
+    g_win_lock  = xSemaphoreCreateMutex();
     g_rx_ring   = xRingbufferCreate(RX_RING_BYTES, RINGBUF_TYPE_NOSPLIT);
 
     esp_event_loop_create_default();
@@ -328,18 +503,8 @@ void app_main(void)
     esp_wifi_init(&cfg);
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);   // la DS est en 802.11b
-    esp_wifi_start();
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    wifi_start_promisc();
     esp_wifi_get_mac(WIFI_IF_STA, g_mac);
-
-    wifi_promiscuous_filter_t filt = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
-    };
-    esp_wifi_set_promiscuous_filter(&filt);
-    esp_wifi_set_promiscuous_rx_cb(promisc_cb);
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(g_channel, WIFI_SECOND_CHAN_NONE);
 
     xTaskCreate(uplink_task,   "uplink",   4096, NULL, 10, NULL);
     xTaskCreate(downlink_task, "downlink", 4096, NULL, 10, NULL);

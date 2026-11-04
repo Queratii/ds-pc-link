@@ -107,14 +107,50 @@ while time.time() < end and not any(e["type"] == dslink.SER_EVT_RX_LINK for e in
 rx = [e for e in evs if e["type"] == dslink.SER_EVT_RX_LINK]
 check("udp evt rx_link", bool(rx) and rx[0]["node"] == 3 and rx[0]["data"] == payload)
 check("udp peer appris", srv.peers.get(3) == ds.getsockname())
+def recv_data(sock, timeout=3.0):
+    """Premier message non vide reçu (le PC envoie aussi des messages vides de maintien)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            pkt, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            break
+        r = dslink.parse_link_payload(pkt)
+        if r is None or r[2]:
+            return pkt
+    return b""
+
+
 srv.send_link(b"Tbonjour")                            # le PC répond à l'adresse apprise
-try:
-    reply, _ = ds.recvfrom(2048)
-except socket.timeout:
-    reply = b""
-check("udp reponse relue en C", c("parsep", reply.hex()).startswith("ok 0 0 8 " + b"Tbonjour".hex()))
+reply = recv_data(ds)
+out = c("parsep", reply.hex()).split()
+check("udp reponse relue en C", len(out) == 5 and out[0] == "ok" and out[1] == "0"
+      and out[3] == "8" and out[4] == b"Tbonjour".hex())
 ds.close()
 srv.close()
+
+# 4 bis bis) Trame radio construite en Python = trame construite en C (hub -> pont radio)
+check("air frame py == C", dslink.build_air_frame(bytes([2, 0, 0, 0, 0, 1]), 3, 42, payload) == frame)
+
+# 4 bis ter) Hub : le message d'une DS est transmis aux autres, avec nœud et seq d'origine,
+# mais pas renvoyé à son émetteur.
+srv = dslink.DsLinkUdp(port=0, bind="127.0.0.1")
+hub = dslink.DsLinkHub([srv])
+ds3 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); ds3.bind(("127.0.0.1", 0)); ds3.settimeout(0.5)
+ds4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); ds4.bind(("127.0.0.1", 0)); ds4.settimeout(2)
+ds4.sendto(dslink.build_link_payload(4, 7, b"S" + bytes(8)), ("127.0.0.1", srv.port))  # DS4 se fait connaître
+end = time.time() + 2
+while time.time() < end and 4 not in srv.peers:
+    time.sleep(0.05)
+ds3.sendto(udp_msg, ("127.0.0.1", srv.port))          # DS3 (nœud 3, seq 42) envoie son état
+got = recv_data(ds4)
+check("hub: DS4 reçoit DS3", dslink.parse_link_payload(got) == (3, 42, payload))
+echo = recv_data(ds3, timeout=1.0)
+check("hub: pas d'écho vers DS3", dslink.parse_link_payload(echo) is None
+      or dslink.parse_link_payload(echo)[0] != 3)
+hub.close()
+ds3.close()
+ds4.close()
 
 # 4 ter) Relais ESP-Pont simulé : le PC s'inscrit par un message vide du nœud 0,
 # les messages des DS arrivent depuis l'adresse du relais, et les réponses y repartent.

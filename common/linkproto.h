@@ -114,6 +114,8 @@ static inline int link_parse_air_frame(const uint8_t *f, size_t frame_len,
 #define SER_CMD_TX_RAW        0x05  // payload : [rate][trame 802.11 sans FCS]
 #define SER_CMD_BEACON_START  0x06  // payload : [intervalle_ms u16 LE][trame]
 #define SER_CMD_BEACON_STOP   0x07  // payload : rien
+#define SER_CMD_MP_TX         0x08  // payload : [flags MP_TX_*][n° de CMD][trame DS] (mode MP, voir plus bas)
+#define SER_CMD_MP_CONFIG     0x09  // payload : [fenêtre de réponses en µs, u16 LE]
 
 // ESP32 -> PC
 #define SER_EVT_PONG          0x80  // payload : [version firmware][mac x6]
@@ -121,10 +123,37 @@ static inline int link_parse_air_frame(const uint8_t *f, size_t frame_len,
 #define SER_EVT_RX_RAW        0x82  // payload : [rssi i8][canal][ts_us u32 LE][trame]
 #define SER_EVT_LOG           0x83  // payload : texte ASCII
 #define SER_EVT_STATS         0x84  // payload : [rx u32][drop u32][tx u32][txerr u32]
+#define SER_EVT_MP_REPLY      0x85  // payload : [n° de CMD][rssi i8][rate][ts_us u32 LE][trame sans FCS]
+#define SER_EVT_MP_WINDOW     0x86  // payload : [n° de CMD][nb de réponses u8][réponses tardives u32 LE]
 
 #define MODE_LINK   0   // homebrew : ne remonte que nos trames LINK_BSSID
 #define MODE_SNIFF  1   // capture : remonte toutes les trames du canal
 #define MODE_NINTENDO 2 // capture filtrée : seulement les adresses Nintendo
+#define MODE_MP_HOST  3 // multijoueur natif : l'ESP32 joue la radio d'une DS hôte émulée
+
+// ---------------------------------------------------------------------------
+// 3) Mode MP_HOST — multijoueur natif Nintendo, émulateur hôte (melonDS)
+// ---------------------------------------------------------------------------
+// melonDS émule la DS hôte ; l'ESP32 lui prête sa radio, de vraies DS sont
+// les clientes. Une "trame DS" est le tampon matériel de la DS émulée :
+//   [0..7]  réservé   [8] débit (RATE_1M / RATE_2M)   [9] canal
+//   [10..11] longueur u16 LE, FCS de 4 octets COMPRIS
+//   [12..]  trame 802.11, puis 4 octets de FCS (non significatifs)
+// L'ESP32 :
+//  - prend comme adresse MAC l'émetteur des trames de l'hôte (addr2), pour
+//    que sa radio acquitte d'elle-même les trames que les clientes lui
+//    adressent (authentification, association) ;
+//  - suit le canal indiqué à l'octet 9 ;
+//  - après une trame marquée MP_TX_CMD, ouvre une fenêtre de réponses :
+//    chaque réponse de cliente (vers 03:09:BF:00:00:10) part aussitôt en
+//    SER_EVT_MP_REPLY, puis SER_EVT_MP_WINDOW clôt la fenêtre. Les deux
+//    portent le n° de CMD donné par le PC : une fin de fenêtre en retard ne
+//    peut pas être prise pour celle de la CMD suivante. Une nouvelle CMD clôt
+//    d'abord la fenêtre précédente si elle est encore ouverte ;
+//  - remonte les autres trames du réseau de l'hôte en SER_EVT_RX_RAW.
+#define MP_TX_CMD             0x01  // la trame est une CMD : ouvrir la fenêtre de réponses
+#define MP_DEFAULT_WINDOW_US  3000  // fenêtre par défaut (les clientes répondent en < 1 ms)
+#define DS_HW_HDR_LEN         12
 
 #define RATE_1M 0x0A
 #define RATE_2M 0x14
@@ -152,6 +181,12 @@ static inline uint16_t crc16_ccitt(const uint8_t *d, size_t n)
 static inline int is_nintendo_mp_multicast(const uint8_t a[6])
 {
     return a[0] == 0x03 && a[1] == 0x09 && a[2] == 0xBF;
+}
+
+// Adresse de destination des réponses des clientes (03:09:BF:00:00:10)
+static inline int is_nintendo_mp_reply(const uint8_t a[6])
+{
+    return is_nintendo_mp_multicast(a) && a[3] == 0x00 && a[4] == 0x00 && a[5] == 0x10;
 }
 
 // Cherche un Information Element "vendor specific" (0xDD) avec l'OUI 00:09:BF

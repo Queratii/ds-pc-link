@@ -9,6 +9,11 @@
  *
  *   DS (noeud 1..15)  --UDP-->  ESP  --UDP-->  PC inscrit
  *   PC (noeud 0)      --UDP-->  ESP  --UDP-->  toutes les DS connues
+ *   PC (hub, noeud N) --UDP-->  ESP  --UDP-->  toutes les DS sauf N
+ *
+ * Le dernier cas sert au hub du PC, qui fait jouer ensemble les DS d'ESP-Pont,
+ * celles du pont radio et celles de melonDS : il renvoie a l'ESP les messages
+ * des autres DS sous leur propre numero de noeud.
  *
  * Les DS n'ont ainsi pas besoin de connaitre l'adresse du PC, qui se trouve
  * de l'autre cote du NAT.

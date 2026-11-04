@@ -5,7 +5,9 @@
 # de BlocksDS diffère, partez de l'exemple "dswifi" fourni avec BlocksDS et
 # ajoutez simplement source/dslink.c et le dossier ../common aux includes.
 
-BLOCKSDS     ?= /opt/blocksds/core
+# Emplacement de BlocksDS : celui de Wonderful Toolchain s'il existe (installation
+# recommandée, y compris sous Windows avec MSYS2), sinon l'emplacement classique.
+BLOCKSDS     ?= $(if $(wildcard /opt/wonderful/thirdparty/blocksds/core),/opt/wonderful/thirdparty/blocksds/core,/opt/blocksds/core)
 
 NAME         := dslink_demo
 GAME_TITLE   := dslink demo
